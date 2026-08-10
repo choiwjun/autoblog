@@ -21,4 +21,6 @@ def load_config():
         "env": os.getenv("ENV", "development").strip().lower(),
         # 발행 API CORS 허용 origin (콤마 구분 — autostudio의 Vercel/로컬 주소)
         "cors_origins": os.getenv("CORS_ORIGINS", ""),
+        # 발행 API rate limit (분당 요청 수)
+        "publish_rate_limit": int(os.getenv("PUBLISH_RATE_LIMIT", "60") or "60"),
     }

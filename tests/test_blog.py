@@ -166,6 +166,44 @@ def test_patch_keeps_status_and_published_at(tmp_path):
     d.close()
 
 
+def test_seo_jsonld_and_tracking(tmp_path):
+    client = TestClient(make_app(tmp_path))
+    cfg = config_mod.load_config()
+    cfg.update({"db_url": f"sqlite:///{tmp_path / 'b2.db'}", "blog_token": "sekret",
+                "ga4_measurement_id": "G-TEST123", "base_url": "http://t.local"})
+    g = TestClient(create_app(cfg))
+    _publish(g, slug="seo-1", title="SEO 글",
+             engine_meta={"faq": [{"q": "질문?", "a": "답변."}]})
+    # 홈: WebSite/Organization JSON-LD + twitter 카드
+    home = g.get("/").text
+    assert '"@type":"WebSite"' in home.replace(" ", "")
+    assert '"@type":"Organization"' in home.replace(" ", "")
+    assert 'name="twitter:card"' in home
+    # 상세: Article+Speakable / Breadcrumb / FAQPage / twitter
+    detail = g.get("/seo-1").text
+    compact = detail.replace(" ", "")
+    assert "SpeakableSpecification" in compact
+    assert '"@type":"FAQPage"' in compact
+    assert '"@type":"Question"' in compact
+    assert 'name="twitter:card" content="summary_large_image"' in detail
+    assert "data-slug=\"seo-1\"" in detail
+    # GA4 설정 시 트래킹 스크립트
+    assert "view_article" in detail and "outbound_click" in detail
+    # GA4 미설정 시 스크립트 미삽입
+    assert "gtag" not in client.get("/").text
+
+
+def test_publish_rate_limit(tmp_path):
+    client = TestClient(make_app(tmp_path))
+    cfg = config_mod.load_config()
+    cfg.update({"db_url": f"sqlite:///{tmp_path / 'b3.db'}", "blog_token": "sekret",
+                "publish_rate_limit": 3, "base_url": "http://t.local"})
+    rl = TestClient(create_app(cfg))
+    for i in range(3):
+        assert _publish(rl, slug=f"rl-{i}").status_code == 200
+    assert _publish(rl, slug="rl-x").status_code == 429  # 초과
+
+
 def test_db_migration_and_categories(tmp_path):
     d = db_mod.Database(f"sqlite:///{tmp_path / 't.db'}")
     d.init()

@@ -9,6 +9,7 @@ import datetime
 import hmac
 import json
 import re
+import time
 from urllib.parse import quote
 
 import bleach
@@ -26,6 +27,23 @@ ALLOWED_TAGS = [
     "table", "thead", "tbody", "tr", "th", "td", "span", "div",
 ]
 ALLOWED_ATTRS = {"a": ["href", "title", "rel"], "img": ["src", "alt", "title"]}
+
+
+class _RateLimiter:
+    """고정 창 rate limit — 윈도우 내 호출 횟수 상한."""
+
+    def __init__(self, limit, window):
+        self.limit = limit
+        self.window = window
+        self.hits = []
+
+    def allow(self):
+        now = time.monotonic()
+        self.hits = [t for t in self.hits if now - t < self.window]
+        if len(self.hits) >= self.limit:
+            return False
+        self.hits.append(now)
+        return True
 
 
 def render_markdown(body_md, base_url=""):
@@ -70,6 +88,13 @@ def create_app(cfg):
                            allow_methods=["POST", "PATCH", "DELETE", "OPTIONS"],
                            allow_headers=["Authorization", "Content-Type"])
     state = {"db": None}
+    # 발행 API rate limit — 분당 N회 (고정 창, 인메모리)
+    limiter = _RateLimiter(int(cfg.get("publish_rate_limit", 60)), 60.0)
+
+    def check_rate_limit():
+        if not limiter.allow():
+            raise HTTPException(status_code=429,
+                                detail="rate limit exceeded (60/min)")
 
     def get_db():
         if state["db"] is None:
@@ -91,12 +116,37 @@ def create_app(cfg):
 
     # ---------- 레이아웃 ----------
 
-    def layout(title, body, og=None, head_extra=""):
+    def layout(title, body, og=None, head_extra="", data_attrs=""):
         ga4 = cfg.get("ga4_measurement_id", "")
         ga_script = (
             f'<script async src="https://www.googletagmanager.com/gtag/js?id={ga4}"></script>'
             f'<script>window.dataLayer=window.dataLayer||[];function gtag(){{dataLayer.push(arguments);}}'
             f'gtag("js",new Date());gtag("config","{ga4}");</script>'
+            f'''<script>
+(function(){{
+  if (!window.gtag) return;
+  var slug = document.body.getAttribute('data-slug');
+  if (slug) gtag('event', 'view_article', {{slug: slug}});
+  var fired = {{}};
+  function onScroll(){{
+    var h = document.documentElement;
+    var p = (h.scrollTop + h.clientHeight) / h.scrollHeight;
+    if (p >= 0.5 && !fired.s50) {{ fired.s50 = 1; gtag('event', 'scroll_50', {{slug: slug || ''}}); }}
+    if (p >= 0.9 && !fired.s90) {{ fired.s90 = 1; gtag('event', 'scroll_90', {{slug: slug || ''}}); }}
+  }}
+  window.addEventListener('scroll', onScroll, {{passive: true}});
+  document.addEventListener('click', function(e){{
+    var a = e.target && e.target.closest ? e.target.closest('a') : null;
+    if (!a) return;
+    var href = a.getAttribute('href') || '';
+    if (/^https?:\\/\\//.test(href) && href.indexOf(location.origin) !== 0) {{
+      gtag('event', 'outbound_click', {{url: href}});
+    }} else if (href.charAt(0) === '/') {{
+      gtag('event', 'internal_click', {{url: href}});
+    }}
+  }});
+}})();
+</script>'''
             if ga4 else "")
         og = og or {}
         og_tags = ""
@@ -107,7 +157,7 @@ def create_app(cfg):
 <title>{_esc(title)}</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css">
 <style>{CSS}</style>
-{og_tags}{head_extra}{ga_script}</head><body>
+{og_tags}{head_extra}{ga_script}</head><body{data_attrs}>
 <header class="site"><div class="wrap">
   <a class="logo" href="/">MYEONG BLOG</a>
   <nav><a href="/">홈</a></nav>
@@ -122,6 +172,18 @@ def create_app(cfg):
 
     def _esc_attr(s):
         return _esc(s).replace("'", "&#39;")
+
+    # 사용자 입력(title 등)이 들어간 JSON-LD는 HTML 탈출 차단.
+    # < > 를 \u003c \u003e 로 치환 — JSON 파서는 원문으로 복원, HTML 파서는 태그로 인식 불가
+    def _safe_json(obj):
+        return json.dumps(obj, ensure_ascii=False).replace(
+            "<", "\\u003c").replace(">", "\\u003e")
+
+    def _twitter_tags(og):
+        t = [f'<meta name="twitter:card" content="summary_large_image">']
+        for prop, val in og.items():
+            t.append(f'<meta name="twitter:{prop[3:]}" content="{_esc_attr(val)}">')
+        return "".join(t)
 
     # ---------- 공개 페이지 ----------
 
@@ -153,7 +215,26 @@ def create_app(cfg):
 <p>오늘의 운세부터 생활 정보까지 — 검색과 AI 답변에 인용되는 글을 씁니다.</p></section>
 <section class="chips">{cats}{tags}</section>
 <section class="grid">{cards}</section>{pager}"""
-        return HTMLResponse(layout("MYEONG BLOG", body))
+        base = cfg["base_url"]
+        og = {"og:title": "MYEONG BLOG — 운세와 정보",
+              "og:type": "website", "og:url": base,
+              "og:site_name": "MYEONG BLOG",
+              "og:description": "오늘의 운세부터 생활 정보까지 — 검색과 AI 답변에 인용되는 글을 씁니다."}
+        org = _safe_json({
+            "@context": "https://schema.org", "@type": "Organization",
+            "name": "MYEONG BLOG", "url": base,
+            "logo": f"{base}/favicon.ico"})
+        website = _safe_json({
+            "@context": "https://schema.org", "@type": "WebSite",
+            "name": "MYEONG BLOG", "url": base,
+            "potentialAction": {"@type": "SearchAction",
+                                "target": {"@type": "EntryPoint",
+                                           "urlTemplate": f"{base}/?q={{search_term_string}}"},
+                                "query-input": "required name=search_term_string"}})
+        head_extra = (_twitter_tags(og)
+                      + f'<link rel="canonical" href="{base}">\n{org}\n{website}')
+        return HTMLResponse(layout("MYEONG BLOG — 운세와 정보", body,
+                                   og, head_extra))
 
     def _post_card(p):
         meta = parse_engine_meta(p)
@@ -251,18 +332,18 @@ def create_app(cfg):
         }
         if post.get("image_url"):
             og["og:image"] = post["image_url"]
-        # JSON-LD: Article — 사용자 입력(title 등)의 HTML 탈출 차단.
-        # < > 를 \u003c \u003e 로 치환 — JSON 파서가 원문으로 복원, HTML 파서는 태그로 인식 불가
-        def _safe_json(obj):
-            return json.dumps(obj, ensure_ascii=False).replace(
-                "<", "\\u003c").replace(">", "\\u003e")
+        # JSON-LD: Article — 사용자 입력(title 등)의 HTML 탈출 차단 (see _safe_json).
         jsonld = _safe_json({
             "@context": "https://schema.org",
             "@type": "Article",
             "headline": post["title"],
             "datePublished": date_pub,
             "dateModified": (post["updated_at"] or date_pub)[:10],
+            "author": {"@type": "Organization", "name": "MYEONG BLOG", "url": base},
+            "publisher": {"@type": "Organization", "name": "MYEONG BLOG", "url": base},
             "mainEntityOfPage": {"@type": "WebPage", "@id": url},
+            "speakable": {"@type": "SpeakableSpecification",
+                          "cssSelector": [".post h1", ".post .content h2"]},
         })
         breadcrumb = _safe_json({
             "@context": "https://schema.org",
@@ -272,6 +353,17 @@ def create_app(cfg):
                 {"@type": "ListItem", "position": 2, "name": post["title"], "item": url},
             ],
         })
+        # FAQPage — engine_meta.faq(질문/답변 목록)가 전달되면 구조화 (AEO)
+        faq_jsonld = ""
+        faq_list = meta.get("faq") if isinstance(meta, dict) else None
+        if isinstance(faq_list, list) and faq_list:
+            faq_jsonld = _safe_json({
+                "@context": "https://schema.org", "@type": "FAQPage",
+                "mainEntity": [
+                    {"@type": "Question", "name": str(f["q"]),
+                     "acceptedAnswer": {"@type": "Answer", "text": str(f["a"])}}
+                    for f in faq_list if isinstance(f, dict) and f.get("q") and f.get("a")]
+            })
         related = d.related_posts(post)
         related_html = ""
         if related:
@@ -290,8 +382,11 @@ def create_app(cfg):
   <div class="chips">{tags_html}</div>
   <div class="content">{body_html}</div>
 </article>{related_html}"""
-        head_extra = f"{robots}\n<link rel=\"canonical\" href=\"{url}\">\n{jsonld}\n{breadcrumb}"
-        return HTMLResponse(layout(post["title"], body, og, head_extra))
+        head_extra = (_twitter_tags(og)
+                      + f"{robots}\n<link rel=\"canonical\" href=\"{url}\">\n"
+                      + f"{jsonld}\n{breadcrumb}" + (f"\n{faq_jsonld}" if faq_jsonld else ""))
+        return HTMLResponse(layout(post["title"], body, og, head_extra,
+                                   f' data-slug="{_esc_attr(post["slug"])}"'))
 
     @app.get("/category/{category}")
     def category_page(category: str):
@@ -328,17 +423,20 @@ def create_app(cfg):
     @app.post("/api/posts")
     async def create_post(request: Request, authorization: str = Header(default="")):
         require_token(authorization)
+        check_rate_limit()
         return await _apply_post(request)
 
     @app.patch("/api/posts/{slug}")
     async def update_post(slug: str, request: Request,
                           authorization: str = Header(default="")):
         require_token(authorization)
+        check_rate_limit()
         return await _apply_post(request, slug)
 
     @app.delete("/api/posts/{slug}")
     def delete_post(slug: str, authorization: str = Header(default="")):
         require_token(authorization)
+        check_rate_limit()
         d = get_db()
         d.delete_post(slug)
         return {"ok": True}
