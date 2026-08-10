@@ -147,6 +147,25 @@ def test_should_index_units():
     assert should_index(normal, today)
     assert should_index(fortune_today, today)
     assert not should_index(fortune_old, today)
+    # weekly — 이번 주에 속하면 index
+    monday = today - datetime.timedelta(days=today.weekday())
+    weekly_this = {"engine_meta": json.dumps(
+        {"fortune_type": "weekly", "ref_date": monday.isoformat()})}
+    weekly_old = {"engine_meta": json.dumps(
+        {"fortune_type": "weekly", "ref_date": "2026-01-05"})}
+    assert should_index(weekly_this, today)
+    assert not should_index(weekly_old, today)
+    # monthly — 이번 달이면 index
+    monthly_this = {"engine_meta": json.dumps(
+        {"fortune_type": "monthly", "ref_date": today.strftime("%Y-%m")})}
+    monthly_old = {"engine_meta": json.dumps(
+        {"fortune_type": "monthly", "ref_date": "2026-01"})}
+    assert should_index(monthly_this, today)
+    assert not should_index(monthly_old, today)
+    # 일주/별자리/띠 — 고정 콘텐츠는 항상 index
+    pillar = {"engine_meta": json.dumps(
+        {"fortune_type": "day_pillar", "ref_date": "2020-01-01"})}
+    assert should_index(pillar, today)
 
 
 def test_patch_keeps_status_and_published_at(tmp_path):

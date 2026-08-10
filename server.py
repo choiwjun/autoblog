@@ -72,10 +72,24 @@ def is_fortune_post(post):
 
 
 def should_index(post, today):
-    """운세 인덱스 정책: 당일 운세만 index, 과거 운세 noindex. 일반 글은 항상."""
-    if not is_fortune_post(post):
+    """운세 인덱스 정책: 당일 운세만 index, 과거 운세 noindex. 일반 글은 항상.
+    - daily: ref_date가 오늘일 때만
+    - weekly/monthly: ref_date가 이번 주/이번 달에 속할 때만
+    - 일주/별자리/띠: 고정 콘텐츠 (반복 재생성 아님) — 항상 index"""
+    meta = parse_engine_meta(post)
+    ftype = meta.get("fortune_type")
+    if not ftype:
         return True
-    return parse_engine_meta(post).get("ref_date") == today.isoformat()
+    ref = meta.get("ref_date", "")
+    if ftype == "daily":
+        return ref == today.isoformat()
+    if ftype == "weekly":
+        monday = today - datetime.timedelta(days=today.weekday())
+        return monday.isoformat() <= ref <= \
+            (monday + datetime.timedelta(days=6)).isoformat()
+    if ftype == "monthly":
+        return str(ref).startswith(today.strftime("%Y-%m"))
+    return True
 
 
 def create_app(cfg):
